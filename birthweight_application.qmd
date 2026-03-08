@@ -771,6 +771,75 @@ print(vif(lm(bw_mean ~ ., data = merged_bw_df_selected %>% dplyr::select(-zip, -
 merged_bw_df_selected <- readRDS("data/birthweight_data_preprocess.rds")
 ```
 
+### Mean Map
+
+```{r message=FALSE, warning=FALSE}
+# ------------------------------------------------------------
+# Fitted mean birthweight maps across selected years
+# Put this right after merged_bw_df_selected is loaded
+# ------------------------------------------------------------
+
+# Keep the same renaming convention used later in the script
+plot_df <- merged_bw_df_selected
+raw_names_plot <- colnames(plot_df)[11:35]
+colnames(plot_df)[11:35] <- paste0("x", 1:25)
+
+# Fit observed mean structure in birthweight:
+# include observed covariates + smooth spatial surface + year FE
+# EXCLUDE pm25 so this reflects baseline spatiotemporal structure,
+# not the treatment effect itself
+mean_formula <- as.formula(
+  paste(
+    "bw_mean ~ s(median_income) + s(lat, long, k = 200) + factor(year) +",
+    paste(colnames(plot_df)[11:35], collapse = " + ")
+  )
+)
+
+fit_mean_bw <- mgcv::gam(mean_formula, data = plot_df)
+
+# Predicted mean function
+plot_df$bw_mean_hat <- predict(fit_mean_bw, newdata = plot_df, type = "response")
+
+# Join to California ZCTA polygons already created earlier in the script
+# zctas_ca should already exist from the earlier mapping block
+# GEOID20 is the 2020 ZCTA identifier in tigris output
+zcta_map_df <- zctas_ca %>%
+  mutate(zip = as.integer(GEOID20)) %>%
+  inner_join(
+    plot_df %>% dplyr::select(zip, year, bw_mean_hat),
+    by = "zip"
+  )
+
+years_show <- c(2018, 2021, 2024)
+
+# Common color scale across years
+val_range <- quantile(zcta_map_df$bw_mean_hat, probs = c(0.02, 0.98), na.rm = TRUE)
+
+p_bw_mean_maps <- lapply(years_show, function(yy) {
+  ggplot(filter(zcta_map_df, year == yy)) +
+    geom_sf(aes(fill = bw_mean_hat), color = NA) +
+    scale_fill_viridis_c(
+      name = "Fitted mean\nbirthweight",
+      limits = val_range,
+      oob = squish
+    ) +
+    labs(title = paste("Fitted mean birthweight,", yy)) +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 12),
+      legend.position = "right"
+    )
+})
+
+p_bw_mean_maps_combined <- wrap_plots(p_bw_mean_maps, ncol = 3)
+p_bw_mean_maps_combined
+
+# Optional save
+# ggsave("birthweight_mean_maps_2018_2021_2024.pdf",
+#        p_bw_mean_maps_combined,
+#        width = 12, height = 4.2, dpi = 300)
+```
+
 ## Partially linear model
 
 ```{r}

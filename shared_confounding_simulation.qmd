@@ -699,6 +699,7 @@ p4
 # ggsave("sim_linear_factor_N500T10_st_error.pdf", p4, width = 6, height = 5, units = "in", dpi = 300)
 ```
 
+
 ## Different adjustment sets
 
 ```{r}
@@ -1552,165 +1553,245 @@ ggsave("sim_interference.png", p7, width = 8, height = 5)
 ## Violation of normality
 
 ```{r}
+## ---- Error generator (Gaussian, t, Uniform, Mixture, Skew-normal, Hetero) ----
 gen_error <- function(type, Tt, N, sigma_target,
                       df_t_err = 4,
                       mixture_p = 0.3,
-                      hetero_scale = NULL) {
-
-  draw_laplace <- function(n) {
-    u <- runif(n, -0.5, 0.5)
-    -sign(u) * log(1 - 2*abs(u))  # Laplace(0,1) scale=1 => Var=2
-  }
+                      hetero_scale = NULL,
+                      skew_alpha = 5) {
 
   if (type == "gaussian") {
-    e <- matrix(rnorm(Tt * N, 0, sigma_target), Tt, N)
+    e <- matrix(rnorm(Tt * N, 0, 1), Tt, N)
 
   } else if (type == "t_df") {
-    # Scale t so variance ~ sigma_target^2; Var(t_df)=df/(df-2)
-    scl <- sigma_target / sqrt(df_t_err / (df_t_err - 2))
-    e <- matrix(rt(Tt * N, df = df_t_err) * scl, Tt, N)
+    e <- matrix(rt(Tt * N, df = df_t_err), Tt, N)
 
-  } else if (type == "laplace") {
-    # Laplace(0,1): Var=2, so scale by sigma_target / sqrt(2)
-    scl <- sigma_target / sqrt(2)
-    e <- matrix(draw_laplace(Tt * N) * scl, Tt, N)
+  } else if (type == "uniform") {
+    # Uniform(-sqrt(3), sqrt(3)) has Var=1
+    e <- matrix(runif(Tt * N, min = -sqrt(3), max = sqrt(3)), Tt, N)
 
   } else if (type == "mixture") {
-    base <- rnorm(Tt * N, 0, sigma_target)
-    outl <- rnorm(Tt * N, 0.5, sigma_target / 2)
+    # Two-component mixture; centered/rescaled below
+    base <- rnorm(Tt * N, 0, 1)
+    outl <- rnorm(Tt * N, 0.5, 0.5)
     choose <- rbinom(Tt * N, 1, mixture_p)
     e <- matrix(ifelse(choose == 1, outl, base), Tt, N)
 
   } else if (type == "skew_norm") {
     if (!requireNamespace("sn", quietly = TRUE)) {
-      stop("skew_norm scenario requested but 'sn' not installed.")
+      stop("skew_norm requested but package 'sn' is not installed.")
     }
-    # Use shape alpha; adjust scale so sd ≈ sigma_target
-    alpha <- 5
-    delta <- alpha / sqrt(1 + alpha^2)
-    adj <- sqrt(1 - (2 * delta^2) / pi)
-    omega <- sigma_target / adj
-    e <- matrix(sn::rsn(Tt * N, xi = 0, omega = omega, alpha = alpha), Tt, N)
+    # rsn returns skew-normal; we center/rescale below
+    e <- matrix(sn::rsn(Tt * N, xi = 0, omega = 1, alpha = skew_alpha), Tt, N)
 
   } else if (type == "hetero") {
-    # heteroskedastic t: hetero_scale is length N vector of multipliers (>=0)
-    if (is.null(hetero_scale)) stop("hetero_scale required for hetero_t")
-    scl_base <- sigma_target / sqrt(df_t_err / (df_t_err - 2))
+    if (is.null(hetero_scale)) stop("hetero_scale required for hetero")
     raw <- matrix(rt(Tt * N, df = df_t_err), Tt, N)
-    e_raw <- raw * matrix(hetero_scale, Tt, N, byrow = TRUE) * scl_base
-    overall_sd <- sd(e_raw)
-    e <- e_raw * (sigma_target / overall_sd)
+    e <- raw * matrix(hetero_scale, Tt, N, byrow = TRUE)
 
   } else {
     stop("Unknown error type: ", type)
   }
+
+  # enforce mean 0 and sd = sigma_target for comparability
+  e <- e - mean(e)
+  e <- e / sd(e) * sigma_target
   e
+}
+
+## Discrete U generator
+gen_discrete_U <- function(t, m, K = 5, prob = NULL, jitter_sd = 0) {
+  if (is.null(prob)) prob <- rep(1 / K, K)
+
+  # K latent "states" in R^m
+  U_class <- matrix(rnorm(K * m), nrow = K, ncol = m)
+
+  # state sequence over time
+  k_t <- sample(1:K, t, replace = TRUE, prob = prob)
+
+  # u_t is one of the K latent vectors each time t
+  u <- U_class[k_t, , drop = FALSE]   # t x m
+
+  # optional small jitter to avoid perfectly discrete series
+  if (jitter_sd > 0) {
+    u <- u + matrix(rnorm(t * m, mean = 0, sd = jitter_sd), nrow = t, ncol = m)
+  }
+
+  # standardize each column to mean 0, sd 1 (comparability across settings)
+  u <- scale(u, center = TRUE, scale = TRUE)
+  u
 }
 ```
 
 ```{r}
+## =========================
+## Simulation
+## =========================
 set.seed(2025)
+
 results_non_Gaussian <- list()
-n_simulations = 50
-error_scenarios <- c("gaussian", "t_df", "laplace", "mixture", "skew_norm", "hetero") 
+n_simulations <- 50
+
+# 6 distributional facets
+dist_types <- c("gaussian", "t_df", "uniform", "mixture", "skew_norm", "hetero")
+
+# 3 structural facets
+struct_types <- c("discreteU", "nonlinearD", "nonlinearY")
+
+facet_types <- c(dist_types, struct_types)
 
 N <- 50
 t <- 100
 m <- 3
-sigmaU <- diag(m)  
+sigmaU <- diag(m)
 df_t_err <- 4
 sigma_D_err <- 1
 sigma_Y_err <- 1
 
-A <- matrix(rnorm(N * m, mean = 0, sd=0.5), nrow = N, ncol = m)
-R <- qr.Q(qr(matrix(rnorm(m*m), m))) 
+A <- matrix(rnorm(N * m, mean = 0, sd = 0.5), nrow = N, ncol = m)
+R <- qr.Q(qr(matrix(rnorm(m * m), m)))
 gamma <- 0.3 * (A %*% R) + 0.5 * A
 B_true <- diag(N)
 
 for (i in 1:n_simulations) {
-  print(paste("iteration", i))
-  # Generate data for the current setting
-  s <- matrix(runif(2 * N, -1, 1), ncol = 2) # N by 2
-  fs <- sin(2*pi*s[,1]*s[,2]) + s[,1] + s[,2] # N by 1
+  cat("iteration", i, "\n")
+
+  # Spatial coords (for heteroskedastic multipliers)
+  s <- matrix(runif(2 * N, -1, 1), ncol = 2)
+  fs <- sin(2 * pi * s[, 1] * s[, 2]) + s[, 1] + s[, 2]
   hetero_scale_D <- 1 + 0.5 * abs(fs)
   hetero_scale_Y <- 1 + 0.5 * abs(fs)
-  
-  for (error_type in error_scenarios) {
-    if (error_type != "hetero"){
-      u <- gen_error(
-      type         = error_type,     
-      Tt           = t,
-      N            = m,              # m latent factors
-      sigma_target = 1,              # unit variance
-      df_t_err     = 4               # for t-distribution
-      )
+
+  for (ftype in facet_types) {
+
+    ## ---- Case group 1: original 6 (distributional / hetero) ----
+    if (ftype %in% dist_types) {
+
+      error_type <- ftype
+
+      # U distribution: follow error_type except "hetero" keeps U Gaussian
+      if (error_type != "hetero") {
+        u <- gen_error(type = error_type, Tt = t, N = m,
+                       sigma_target = 1, df_t_err = df_t_err)  # t x m
+      } else {
+        u <- mvtnorm::rmvnorm(t, sigma = sigmaU)  # t x m
+      }
+
+      epsD <- gen_error(type = error_type, Tt = t, N = N,
+                        sigma_target = sigma_D_err, df_t_err = df_t_err,
+                        hetero_scale = if (error_type == "hetero") hetero_scale_D else NULL)
+      epsY <- gen_error(type = error_type, Tt = t, N = N,
+                        sigma_target = sigma_Y_err, df_t_err = df_t_err,
+                        hetero_scale = if (error_type == "hetero") hetero_scale_Y else NULL)
+
+      d <- (u %*% t(A)) + epsD
+      y <- (d %*% t(B_true)) + (u %*% t(gamma)) + epsY
     }
-    else{
-      u <- mvtnorm::rmvnorm(t, sigma = sigmaU)
+
+    ## ---- Group 2: structural facets (Gaussian eps to isolate structure) ----
+    if (ftype %in% struct_types) {
+
+      epsD <- gen_error(type = "gaussian", Tt = t, N = N,
+                        sigma_target = sigma_D_err, df_t_err = df_t_err)
+      epsY <- gen_error(type = "gaussian", Tt = t, N = N,
+                        sigma_target = sigma_Y_err, df_t_err = df_t_err)
+
+      if (ftype == "discreteU") {
+        # Discrete confounders per time
+        u <- gen_discrete_U(t = t, m = m, K = 5, prob = c(0.1, 0.15, 0.2, 0.25, 0.3), jitter_sd = 0)
+
+        d <- (u %*% t(A)) + epsD
+        y <- (d %*% t(B_true)) + (u %*% t(gamma)) + epsY
+
+      } else {
+        # Gaussian U for nonlinear exposure/outcome cases
+        u <- mvtnorm::rmvnorm(t, sigma = sigmaU)  # t x m
+        lin <- u %*% t(A)  # t x N
+
+        if (ftype == "nonlinearD") {
+          d <- lin + 0.5 * (lin^2 - mean(lin^2)) + epsD
+          y <- (d %*% t(B_true)) + (u %*% t(gamma)) + epsY
+
+        } else if (ftype == "nonlinearY") {
+          conf_lin <- u %*% t(gamma)            # t x N
+          conf_nl  <- (conf_lin^2 - mean(conf_lin^2))
+
+          d <- lin + epsD
+          y <- (d %*% t(B_true)) + conf_lin + 0.5 * conf_nl + epsY
+        }
+      }
     }
-    
-    epsD <- gen_error(type = error_type,
-                      Tt = t, N = N,
-                      sigma_target = sigma_D_err,
-                      df_t_err = df_t_err,
-                      hetero_scale = if (error_type == "hetero") hetero_scale_D else NULL)
-    epsY <- gen_error(type = error_type,
-                      Tt = t, N = N,
-                      sigma_target = sigma_Y_err,
-                      df_t_err = df_t_err,
-                      hetero_scale = if (error_type == "hetero") hetero_scale_Y else NULL)
-    d <- u %*% t(A) + epsD  # t by N
-    y <- d %*% t(B_true) + u %*% t(gamma) + epsY
-    
-    dml_rf <- dml_plm(NULL, as.vector(d), as.vector(y), dreg, yreg, nfold=5)
-  
-    # Loop over models
+
+    # Center d,y for estimator comparability
+    d <- scale(d, center = TRUE, scale = FALSE)
+    y <- scale(y, center = TRUE, scale = FALSE)
+
+    # Cache for DML
+    dml_rf <- dml_plm(NULL, as.vector(d), as.vector(y), dreg, yreg, nfold = 5)
+
     for (model in c("stack_dml", "nc_mfactor", "ife")) {
-      estimate <- fit_spatial_invariant(model, s, d, y, m, dml_rf)  # Fit the model 
+      estimate <- fit_spatial_invariant(model, s, d, y, m, dml_rf)
+
       results_non_Gaussian[[length(results_non_Gaussian) + 1]] <- data.frame(
         simulation = i,
         model = model,
         estimate = estimate,
-        error = error_type
+        facet = ftype
       )
     }
   }
 }
 
-# Combine results into a data frame
 results_non_Gaussian_df <- do.call(rbind, results_non_Gaussian)
-
-results_non_Gaussian_df <- results_non_Gaussian_df %>%
-  mutate(model = case_when(
-    model == "stack_dml" ~ "NUC",
-    model == "nc_mfactor" ~ "FC",
-    model == "ife" ~ "IFE",
-    TRUE ~ model
-  ),
-  error = case_when(
-    error == "gaussian" ~ "Gaussian",
-    error == "t_df" ~ "Student-t (df = 4)",
-    error == "laplace" ~ "Laplace",
-    error == "mixture" ~ "Mixture",
-    error == "skew_norm" ~ "Skewed",
-    error == "hetero" ~ "Heteroskedastic"
-    ))
-
-# saveRDS(results_non_Gaussian_df, file = "sim_nonGaussian_N50T100.rds")
 ```
 
 ```{r}
-results_non_Gaussian_df$model <- factor(results_non_Gaussian_df$model, levels = c("NUC", "IFE", "FC"))
+## ---- Labels ----
+results_non_Gaussian_df <- results_non_Gaussian_df %>%
+  mutate(
+    model = case_when(
+      model == "stack_dml" ~ "NUC",
+      model == "nc_mfactor" ~ "FC",
+      model == "ife" ~ "IFE",
+      TRUE ~ model
+    ),
+    facet = case_when(
+      facet == "gaussian"   ~ "Gaussian",
+      facet == "t_df"       ~ "Student-t",
+      facet == "uniform"    ~ "Uniform",
+      facet == "mixture"    ~ "Mixture",
+      facet == "skew_norm"  ~ "Skewed",
+      facet == "hetero"     ~ "Heteroskedastic",
+      facet == "discreteU"   ~ "Discrete",
+      facet == "nonlinearD" ~ "Nonlinear exposure",
+      facet == "nonlinearY" ~ "Nonlinear outcome",
+      TRUE ~ facet
+    )
+  )
+
+results_non_Gaussian_df$model <- factor(results_non_Gaussian_df$model,
+                                       levels = c("NUC", "IFE", "FC"))
+
+# Fix facet order explicitly
+facet_levels <- c("Gaussian","Student-t","Uniform","Mixture","Skewed",
+                  "Heteroskedastic", "Discrete","Nonlinear exposure",
+                  "Nonlinear outcome")
+results_non_Gaussian_df$facet <- factor(results_non_Gaussian_df$facet, levels = facet_levels)
+```
+
+```{r}
+## =========================
+## Plot: 9 facets
+## =========================
 
 p8 <- ggplot(results_non_Gaussian_df,
-       aes(x = model, y = estimate, fill = model)) +
-  geom_hline(yintercept = 1, linetype = "dashed", color = "red", size = 0.4) +
-  geom_boxplot(outlier.size = 0.7, width = 0.65) +
-  facet_wrap(~ error, nrow = 2) +
-  labs(title = "Estimates under Varying Factor and Error Distributions",
+             aes(x = model, y = estimate, fill = model)) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red", linewidth = 0.4) +
+  geom_boxplot(fill = "dark gray") +
+  facet_wrap(~ facet, nrow = 3) +
+  labs(title = "Estimates under distributional and structural departures",
        x = "Estimator",
-       y = "Estimated Effect",
-       fill = "Estimator") +
+       y = "Estimated effect") +
   theme_bw() +
   theme(
     strip.background = element_rect(fill = "grey90", color = NA),
@@ -1718,9 +1799,10 @@ p8 <- ggplot(results_non_Gaussian_df,
     legend.position = "none",
     plot.title = element_text(face = "bold")
   ) +
-  coord_cartesian(ylim = c(0.95, 1.35))
+  coord_cartesian(ylim = c(0.94, 1.33))
 
-# ggsave("sim_nonGaussian_N50T100.pdf", p8, width = 6, height = 5, units = "in", dpi = 300)
+print(p8)
+# ggsave("sim_nonGaussian_N50T100.pdf", p8, width = 6, height = 7, units = "in", dpi = 300)
 ```
 
 ## Exchange spatial and time invariant confounding
