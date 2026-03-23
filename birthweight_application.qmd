@@ -810,7 +810,7 @@ zcta_map_df <- zctas_ca %>%
     by = "zip"
   )
 
-years_show <- c(2018, 2021, 2024)
+years_show <- c(2018, 2024)
 
 # Common color scale across years
 val_range <- quantile(zcta_map_df$bw_mean_hat, probs = c(0.02, 0.98), na.rm = TRUE)
@@ -819,25 +819,32 @@ p_bw_mean_maps <- lapply(years_show, function(yy) {
   ggplot(filter(zcta_map_df, year == yy)) +
     geom_sf(aes(fill = bw_mean_hat), color = NA) +
     scale_fill_viridis_c(
-      name = "Fitted mean\nbirthweight",
+      name = "Mean birthweight (grams)",
       limits = val_range,
-      oob = squish
+      oob = scales::squish
     ) +
-    labs(title = paste("Fitted mean birthweight,", yy)) +
+    labs(title = yy) +
     theme_void() +
     theme(
-      plot.title = element_text(hjust = 0.5, size = 12),
-      legend.position = "right"
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      legend.position = "right",
+      legend.title = element_text(size = 11),
+      legend.text = element_text(size = 10)
     )
 })
 
-p_bw_mean_maps_combined <- wrap_plots(p_bw_mean_maps, ncol = 3)
+p_bw_mean_maps_combined <- wrap_plots(p_bw_mean_maps, ncol = length(years_show)) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = "Estimated Mean Birthweight by ZIP Code (ZCTA)"
+  ) &
+  theme(legend.position = "right")
 p_bw_mean_maps_combined
 
 # Optional save
-# ggsave("birthweight_mean_maps_2018_2021_2024.pdf",
+# ggsave("birthweight_mean_maps_2018_2024.pdf",
 #        p_bw_mean_maps_combined,
-#        width = 12, height = 4.2, dpi = 300)
+#        width = 8, height = 5, dpi = 300)
 ```
 
 ## Partially linear model

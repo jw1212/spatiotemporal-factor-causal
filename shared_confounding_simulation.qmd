@@ -1550,7 +1550,7 @@ ggsave("sim_interference.png", p7, width = 8, height = 5)
 # ggsave("sim_spatial_interference_N50T200.pdf", p7, width = 6, height = 5, units = "in", dpi = 300)
 ```
 
-## Violation of normality
+## Violation of normality and linearity
 
 ```{r}
 ## ---- Error generator (Gaussian, t, Uniform, Mixture, Skew-normal, Hetero) ----
@@ -1623,7 +1623,7 @@ gen_discrete_U <- function(t, m, K = 5, prob = NULL, jitter_sd = 0) {
 }
 ```
 
-```{r}
+```{r, message=FALSE, warning=FALSE}
 ## =========================
 ## Simulation
 ## =========================
@@ -1645,8 +1645,8 @@ t <- 100
 m <- 3
 sigmaU <- diag(m)
 df_t_err <- 4
-sigma_D_err <- 1
-sigma_Y_err <- 1
+sigma_D_err <- 0.7
+sigma_Y_err <- 0.7
 
 A <- matrix(rnorm(N * m, mean = 0, sd = 0.5), nrow = N, ncol = m)
 R <- qr.Q(qr(matrix(rnorm(m * m), m)))
@@ -1709,15 +1709,18 @@ for (i in 1:n_simulations) {
         lin <- u %*% t(A)  # t x N
 
         if (ftype == "nonlinearD") {
-          d <- lin + 0.5 * (lin^2 - mean(lin^2)) + epsD
+          lin_nl <- lin^3
+          lin_nl <- scale(lin_nl, center = TRUE, scale = TRUE)
+          d <- lin_nl + epsD
           y <- (d %*% t(B_true)) + (u %*% t(gamma)) + epsY
 
         } else if (ftype == "nonlinearY") {
           conf_lin <- u %*% t(gamma)            # t x N
-          conf_nl  <- (conf_lin^2 - mean(conf_lin^2))
+          conf_nl <- sin(conf_lin)
+          conf_nl <- scale(conf_nl, center = TRUE, scale = TRUE)
 
           d <- lin + epsD
-          y <- (d %*% t(B_true)) + conf_lin + 0.5 * conf_nl + epsY
+          y <- (d %*% t(B_true)) + conf_nl + epsY
         }
       }
     }
@@ -1799,11 +1802,289 @@ p8 <- ggplot(results_non_Gaussian_df,
     legend.position = "none",
     plot.title = element_text(face = "bold")
   ) +
-  coord_cartesian(ylim = c(0.94, 1.33))
+  coord_cartesian(ylim = c(0.94, 1.4))
 
 print(p8)
 # ggsave("sim_nonGaussian_N50T100.pdf", p8, width = 6, height = 7, units = "in", dpi = 300)
 ```
+
+## Rank comparison
+
+```{r}
+## ============================================================
+## Exact factor rank sensitivity under spatially invariant confounding
+## Rank selection via Bai-Ng IC on [D, Y - beta_tilde D]
+## Compare FC(3), FC(6), FC(selected)
+## ============================================================
+
+set.seed(2026)
+
+# -----------------------------
+# Settings
+# -----------------------------
+n_simulations <- 50
+N <- 30
+t <- 100
+beta0 <- 1
+
+true_rank_grid <- c(3, 6, 10)
+fit_rank_grid  <- c(3, 6)
+
+# candidate ranks for selected FC
+rank_candidates <- c(1, 2, 3, 4, 5, 6, 8, 10, 12, 15)
+
+sigma_D_err <- 0.5
+sigma_Y_err <- 0.5
+
+# -----------------------------
+# Helpers
+# -----------------------------
+scale_panel <- function(M) {
+  M <- scale(M, center = TRUE, scale = FALSE)
+  as.matrix(M / sd(as.vector(M)))
+}
+
+# rank-r truncated SVD reconstruction
+svd_reconstruct <- function(W, r) {
+  s <- svd(W)
+  if (r == 0) {
+    return(matrix(0, nrow = nrow(W), ncol = ncol(W)))
+  }
+  U_r <- s$u[, 1:r, drop = FALSE]
+  V_r <- s$v[, 1:r, drop = FALSE]
+  D_r <- diag(s$d[1:r], nrow = r, ncol = r)
+  U_r %*% D_r %*% t(V_r)
+}
+
+# Bai-Ng style IC on reduced-form joint panel:
+# W = [D, Y - beta_tilde D]
+choose_rank_bn_joint <- function(d, y, rank_candidates, ic_type = "IC2") {
+  # pooled slope to partially remove direct treatment effect
+  beta_tilde <- coef(lm(as.vector(y) ~ as.vector(d)))[2]
+
+  y_tilde <- y - beta_tilde * d
+
+  # center columns
+  W <- cbind(
+    scale(d, center = TRUE, scale = FALSE),
+    scale(y_tilde, center = TRUE, scale = FALSE)
+  )
+
+  TT <- nrow(W)
+  PP <- ncol(W)
+
+  max_rank_allowed <- min(TT, PP) - 1L
+  rank_candidates <- sort(unique(rank_candidates))
+  rank_candidates <- rank_candidates[rank_candidates <= max_rank_allowed]
+
+  ic_vals <- numeric(length(rank_candidates))
+  names(ic_vals) <- rank_candidates
+
+  for (j in seq_along(rank_candidates)) {
+    r <- rank_candidates[j]
+    W_hat <- svd_reconstruct(W, r)
+    V_r <- mean((W - W_hat)^2)
+
+    penalty <- switch(
+      ic_type,
+      IC1 = r * ((TT + PP) / (TT * PP)) * log((TT * PP) / (TT + PP)),
+      IC2 = r * ((TT + PP) / (TT * PP)) * log(min(TT, PP)),
+      IC3 = r * (log(min(TT, PP)) / min(TT, PP)),
+      stop("Unknown ic_type")
+    )
+
+    ic_vals[j] <- log(V_r) + penalty
+  }
+
+  as.integer(rank_candidates[which.min(ic_vals)])
+}
+
+# compile once
+sm_nc_factor_rank <- cmdstanr::cmdstan_model("stan/multi_nc_linear_factor.stan")
+
+fit_fc_rank_spatial <- function(d, y, M_use) {
+  data_list <- list(
+    K = ncol(d),   # N
+    Q = ncol(y),   # N
+    N = nrow(d),   # t
+    M = as.integer(M_use),
+    d = d,
+    y = y
+  )
+
+  opt_result <- sm_nc_factor_rank$optimize(
+    data = data_list,
+    init = 2,
+    iter = 1000,
+    show_messages = FALSE
+  )
+
+  as.numeric(opt_result$mle("beta"))
+}
+
+# -----------------------------
+# Simulation
+# -----------------------------
+results_rank_fc <- list()
+selected_rank_log <- list()
+
+for (m_true in true_rank_grid) {
+  cat("true rank =", m_true, "\n")
+
+  # fixed loadings within each true-rank setting
+  A <- matrix(rnorm(N * m_true, mean = 0, sd = 0.5), nrow = N, ncol = m_true)
+  R <- qr.Q(qr(matrix(rnorm(m_true * m_true), m_true)))
+  gamma <- 0.3 * (A %*% R) + 0.5 * A
+
+  for (i in 1:n_simulations) {
+
+    # latent factors vary over time: t x m_true
+    U <- mvtnorm::rmvnorm(t, sigma = diag(m_true))
+
+    # exact shared factor confounding
+    conf_D <- scale_panel(U %*% t(A))
+    conf_Y <- scale_panel(U %*% t(gamma))
+
+    epsD <- matrix(rnorm(t * N, sd = sigma_D_err), nrow = t, ncol = N)
+    epsY <- matrix(rnorm(t * N, sd = sigma_Y_err), nrow = t, ncol = N)
+
+    d <- conf_D + epsD
+    y <- beta0 * d + conf_Y + epsY
+
+    d <- scale(d, center = TRUE, scale = FALSE)
+    y <- scale(y, center = TRUE, scale = FALSE)
+
+    # better selected rank
+    m_hat <- choose_rank_bn_joint(
+      d = d,
+      y = y,
+      rank_candidates = rank_candidates,
+      ic_type = "IC2"
+    )
+
+    selected_rank_log[[length(selected_rank_log) + 1]] <- data.frame(
+      simulation = i,
+      true_rank = m_true,
+      selected_rank = m_hat
+    )
+
+    # fixed-rank fits
+    for (m_fit in fit_rank_grid) {
+      est <- fit_fc_rank_spatial(d, y, M_use = m_fit)
+
+      results_rank_fc[[length(results_rank_fc) + 1]] <- data.frame(
+        simulation = i,
+        true_rank = m_true,
+        fitted_rank = m_fit,
+        model = paste0("FC(", m_fit, ")"),
+        estimate = est,
+        error = est - beta0
+      )
+    }
+
+    # selected-rank fit
+    est_sel <- fit_fc_rank_spatial(d, y, M_use = m_hat)
+
+    results_rank_fc[[length(results_rank_fc) + 1]] <- data.frame(
+      simulation = i,
+      true_rank = m_true,
+      fitted_rank = m_hat,
+      model = "FC(selected)",
+      estimate = est_sel,
+      error = est_sel - beta0
+    )
+  }
+}
+
+# -----------------------------
+# Data frames
+# -----------------------------
+results_rank_fc_df <- dplyr::bind_rows(results_rank_fc) %>%
+  dplyr::mutate(
+    model = factor(model, levels = c("FC(3)", "FC(6)", "FC(selected)")),
+    true_rank_label = factor(
+      paste0("true rank = ", true_rank),
+      levels = paste0("true rank = ", true_rank_grid)
+    )
+  )
+
+selected_rank_df <- dplyr::bind_rows(selected_rank_log) %>%
+  dplyr::mutate(
+    true_rank_label = factor(
+      paste0("true rank = ", true_rank),
+      levels = paste0("true rank = ", true_rank_grid)
+    )
+  )
+
+# -----------------------------
+# Summaries
+# -----------------------------
+summary_rank_fc <- results_rank_fc_df %>%
+  dplyr::group_by(true_rank, model) %>%
+  dplyr::summarise(
+    mean_est = mean(estimate),
+    bias = mean(error),
+    rmse = sqrt(mean(error^2)),
+    sd_est = sd(estimate),
+    .groups = "drop"
+  )
+
+print(summary_rank_fc)
+
+selected_rank_tab <- selected_rank_df %>%
+  dplyr::count(true_rank, selected_rank) %>%
+  dplyr::group_by(true_rank) %>%
+  dplyr::mutate(prop = n / sum(n)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    true_rank_label = factor(
+      paste0("true rank = ", true_rank),
+      levels = paste0("true rank = ", true_rank_grid)
+    )
+  )
+
+print(selected_rank_tab)
+
+# -----------------------------
+# Main figure: estimation error by true rank
+# -----------------------------
+p_rank_fc <- ggplot(results_rank_fc_df[results_rank_fc_df$true_rank != 15,],
+                    aes(x = model, y = error, fill = model)) +
+  geom_boxplot(fill = "dark gray", outlier.alpha = 0.3, width = 0.75) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  facet_wrap(~ true_rank_label, nrow = 1, scales = "free_y") +
+  labs(
+    x = NULL,
+    y = expression(hat(beta) - beta),
+    title = "FC Sensitivity to Factor-Rank Specification"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 25, hjust = 1)
+  )
+
+print(p_rank_fc)
+# ggsave("sim_rank_fc_N30T100.pdf", p_rank_fc, width = 8, height = 5, units = "in", dpi = 300)
+
+-----------------------------
+# Supplementary figure: selected rank frequencies
+# -----------------------------
+p_rank_sel <- ggplot(selected_rank_tab[selected_rank_tab$true_rank != 15,],
+                     aes(x = factor(selected_rank), y = prop)) +
+  geom_col(width = 0.75, fill = "gray60") +
+  facet_wrap(~ true_rank_label, nrow = 1) +
+  labs(
+    x = "Selected rank",
+    y = "Proportion",
+    title = "Empirical Distribution of Selected Ranks"
+  ) +
+  theme_bw(base_size = 14)
+
+print(p_rank_sel)
+# ggsave("sim_rank_sel_N30T100.pdf", p_rank_sel, width = 8, height = 5, units = "in", dpi = 300)
+```
+
 
 ## Exchange spatial and time invariant confounding
 
