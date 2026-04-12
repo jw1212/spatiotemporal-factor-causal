@@ -1814,10 +1814,18 @@ run_nonlinear_sim <- function(
     sigma_Y_err = 0.7,
     exposure_types = c("linear_plus_cubic", "cubic", "tanh"),
     outcome_types = c("linear_plus_cubic", "sine", "tanh"),
+    both_pairs = list(
+      c("linear_plus_cubic", "linear_plus_cubic"),
+      c("cubic", "sine"),
+      c("tanh", "tanh")
+    ),
     m_fit = m,
     dreg,
     yreg,
-    seed = 2026) {
+    seed = 2026,
+    exposure_loading_scale = 1,
+    outcome_loading_scale = 1,
+    outcome_nonlinear_scale = 1) {
 
   set.seed(seed)
 
@@ -1826,6 +1834,16 @@ run_nonlinear_sim <- function(
   gamma <- params$gamma
   B_true <- params$B_true
   sigmaU <- diag(m)
+  
+  nice_label <- function(x) {
+    dplyr::case_when(
+      x == "linear_plus_cubic" ~ "Lin + Cubic",
+      x == "cubic" ~ "Cubic",
+      x == "tanh" ~ "Tanh",
+      x == "sine" ~ "Sine",
+      TRUE ~ x
+    )
+  }
 
   results <- list()
 
@@ -1837,9 +1855,12 @@ run_nonlinear_sim <- function(
     u <- mvtnorm::rmvnorm(t, sigma = sigmaU)
     epsD <- gen_error("gaussian", t, N, sigma_D_err)
     epsY <- gen_error("gaussian", t, N, sigma_Y_err)
+    
+    A_weak <- exposure_loading_scale * A
+    gamma_strong <- outcome_loading_scale * gamma
 
-    lin_D <- u %*% t(A)      # BU-type exposure index
-    lin_Y <- u %*% t(gamma)  # Gamma U-type confounding index
+    lin_D <- u %*% t(A_weak)
+    lin_Y <- u %*% t(gamma_strong)
 
     # Nonlinear exposure settings
     for (etype in exposure_types) {
@@ -1849,44 +1870,42 @@ run_nonlinear_sim <- function(
 
       fit_df <- run_estimators(s, d, y, m_fit = m_fit, dreg = dreg, yreg = yreg)
       fit_df$simulation <- i
-      fit_df$facet <- paste0("Exp: ", case_when(
-        etype == "linear_plus_cubic" ~ "Lin + Cubic",
-        etype == "cubic" ~ "Cubic",
-        etype == "tanh" ~ "Tanh"
-      ))
-
+      fit_df$facet <- paste0("Exp: ", nice_label(etype))
       results[[length(results) + 1]] <- fit_df
     }
 
     # Nonlinear outcome-confounding settings
     for (ytype in outcome_types) {
-      conf_signal <- apply_nonlinearity(lin_Y, ytype)
+      conf_signal <- outcome_nonlinear_scale * apply_nonlinearity(lin_Y, ytype)
       d <- lin_D + epsD
       y <- d %*% t(B_true) + conf_signal + epsY
 
       fit_df <- run_estimators(s, d, y, m_fit = m_fit, dreg = dreg, yreg = yreg)
       fit_df$simulation <- i
-      fit_df$facet <- paste0("Out: ", case_when(
-        ytype == "linear_plus_cubic" ~ "Lin + Cubic",
-        ytype == "sine" ~ "Sine",
-        ytype == "tanh" ~ "Tanh"
-      ))
+      fit_df$facet <- paste0("Out: ", nice_label(ytype))
+      results[[length(results) + 1]] <- fit_df
+    }
+    
+    # both nonlinear
+    for (pair in both_pairs) {
+      etype <- pair[1]
+      ytype <- pair[2]
 
+      d_signal <- apply_nonlinearity(lin_D, etype)
+      conf_signal <- outcome_nonlinear_scale * apply_nonlinearity(lin_Y, ytype)
+
+      d <- d_signal + epsD
+      y <- d %*% t(B_true) + conf_signal + epsY
+
+      fit_df <- run_estimators(s, d, y, m_fit = m_fit, dreg = dreg, yreg = yreg)
+      fit_df$simulation <- i
+      fit_df$facet <- paste0("Both: ", nice_label(etype), " / ", nice_label(ytype))
       results[[length(results) + 1]] <- fit_df
     }
   }
 
-  bind_rows(results) %>%
-    label_models() %>%
-    mutate(
-      facet = factor(
-        facet,
-        levels = c(
-          "Exp: Lin + Cubic", "Exp: Cubic", "Exp: Tanh",
-          "Out: Lin + Cubic", "Out: Sine", "Out: Tanh"
-        )
-      )
-    )
+  dplyr::bind_rows(results) %>%
+    label_models()
 }
 
 ## ============================================================
@@ -1935,6 +1954,47 @@ plot_nonlinear <- function(df) {
     )
 }
 
+plot_nonlinear <- function(df, nrow = 2) {
+  facet_levels <- unique(df$facet)
+  
+  facet_labs <- c(
+    "Exp: Lin + Cubic" = "Exp: Lin + Cubic",
+    "Exp: Cubic" = "Exp: Cubic",
+    "Exp: Tanh" = "Exp: Tanh",
+    "Out: Lin + Cubic" = "Out: Lin + Cubic",
+    "Out: Sine" = "Out: Sine",
+    "Out: Tanh" = "Out: Tanh",
+    "Both: Lin + Cubic / Lin + Cubic" = "Both:\nLin + Cubic / Lin + Cubic",
+    "Both: Cubic / Sine" = "Both:\nCubic / Sine",
+    "Both: Tanh / Tanh" = "Both:\nTanh / Tanh"
+  )
+
+  ggplot(df, aes(x = model, y = estimate, fill = model)) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "red", linewidth = 0.4) +
+    geom_boxplot(fill = "dark gray") +
+    facet_wrap(
+      ~ facet,
+      nrow = nrow,
+      scales = "free_y",
+      labeller = as_labeller(facet_labs)
+    ) +
+    labs(
+      title = "Estimates under Nonlinear Misspecification",
+      x = NULL,
+      y = "Estimated effect"
+    ) +
+    theme_bw() +
+    theme(
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6),
+      strip.background = element_rect(fill = "grey90", color = "black", linewidth = 0.6),
+      strip.text = element_text(size = 10, face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "none",
+      plot.title = element_text(face = "bold"),
+      plot.margin = ggplot2::margin(8, 8, 8, 8)
+    )
+}
+
 ```
 
 ```{r}
@@ -1965,7 +2025,7 @@ results_nonGaussian_df <- run_nonGaussian_sim(
 
 # Part 2: Nonlinear
 results_nonlinear_df <- run_nonlinear_sim(
-  n_simulations = 50,
+  n_simulations = 10,
   N = 30,
   t = 100,
   m = 3,
@@ -1973,10 +2033,13 @@ results_nonlinear_df <- run_nonlinear_sim(
   sigma_Y_err = 0.7,
   exposure_types = c("linear_plus_cubic", "cubic", "tanh"),
   outcome_types = c("linear_plus_cubic", "sine", "tanh"),
-  m_fit = 3,
+  m_fit = 6,
   dreg = dreg,
   yreg = yreg,
-  seed = 2026
+  seed = 2026,
+  exposure_loading_scale = 1,
+  outcome_loading_scale = 1,
+  outcome_nonlinear_scale = 1
 )
 
 ## ============================================================

@@ -20,9 +20,7 @@ source("utilities.R")
 options(mc.cores=parallel::detectCores())
 ```
 
-## First simulation
-
-## Nonlinear effect
+## Simulation 1: nonlinear, heterogeneous
 
 ```{r}
 # Simulation setting
@@ -102,7 +100,7 @@ ind_bias <- diag(diag(k) %*% tilde_Gamma %*% t(A_mat) %*% diag(k) / Sigma_D)
 print(ind_bias)
 ```
 
-Use the first estimator to estimate effect and bias matrix. 
+Use the first estimator to estimate effect and bias matrix.
 
 ```{r}
 set.seed(123)
@@ -369,7 +367,7 @@ p6
 # ggsave("sim_nonlinear_Factor_5outcomes.pdf", p6, width = 6, height = 5, units = "in", dpi = 300)
 ```
 
-## Second simulation
+## Simulation 2: homogeneous
 
 Second example of nonlinear effect: same effect across unit and time.
 
@@ -540,4 +538,628 @@ f_true_vals <- f_true( (d_grid - sim$d_mean)/sim$d_sd )
   legend("topleft", c("Estimated", "True"), lwd = 2, lty = c(1,2), bty = "n")
 ```
 
+## Simulation 3: model misspecification
 
+```{r}
+# ============================================================
+# Nonlinear causal effect robustness simulation
+# - No X covariates
+# - Fit the existing nonlinear FC model
+# - Stress non-Gaussianity / nonlinear confounding only
+# - Keep output manageable:
+#     1) heatmaps for scalar errors over all settings x g
+#     2) curve panels only for selected settings
+# ============================================================
+
+library(cmdstanr)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(splines2)
+
+source("utilities.R")
+
+set.seed(123)
+
+# -----------------------------
+# 1. Compile Stan model once
+# -----------------------------
+sm_nl <- cmdstanr::cmdstan_model("stan/nonlinear_factor.stan")
+
+# -----------------------------
+# 2. Helpers: truths g(z), g'(z)
+# z is standardized D
+# -----------------------------
+make_g_library <- function() {
+  list(
+    g1_linear = list(
+      label = "Linear",
+      f  = function(z) z,
+      df = function(z) rep(1, length(z))
+    ),
+    g2_tanh = list(
+      label = "tanh",
+      f  = function(z) 1.2 * tanh(0.9 * z),
+      df = function(z) 1.2 * 0.9 * (1 / cosh(0.9 * z))^2
+    ),
+    g3_quad = list(
+      label = "Quadratic",
+      f  = function(z) 0.35 * z^2,
+      df = function(z) 0.7 * z
+    ),
+    g4_sine = list(
+      label = "Sine",
+      f  = function(z) 0.9 * sin(pi * z / 2),
+      df = function(z) 0.9 * (pi / 2) * cos(pi * z / 2)
+    ),
+    g5_cubic = list(
+      label = "Cubic",
+      f  = function(z) 0.18 * z^3,
+      df = function(z) 0.54 * z^2
+    )
+  )
+}
+
+g_lib <- make_g_library()
+
+# -----------------------------
+# 3. Noise generators
+# -----------------------------
+scale_to_sd1 <- function(x) {
+  x <- as.numeric(x)
+  x <- x - mean(x)
+  s <- sd(x)
+  if (s < 1e-8) return(rep(0, length(x)))
+  x / s
+}
+
+r_t_scaled <- function(n, df = 3) {
+  scale_to_sd1(rt(n, df = df))
+}
+
+r_unif_scaled <- function(n) {
+  scale_to_sd1(runif(n, -sqrt(3), sqrt(3)))
+}
+
+r_mix_scaled <- function(n, p = 0.3, mu = 2.0) {
+  z <- rnorm(n)
+  ind <- rbinom(n, 1, p)
+  x <- z + ind * mu
+  scale_to_sd1(x)
+}
+
+gen_latent_matrix <- function(N, M, type = c("gaussian", "t3", "uniform", "mixture")) {
+  type <- match.arg(type)
+  out <- matrix(0, nrow = N, ncol = M)
+  for (m in seq_len(M)) {
+    out[, m] <- switch(
+      type,
+      gaussian = rnorm(N),
+      t3       = r_t_scaled(N, df = 3),
+      uniform  = r_unif_scaled(N),
+      mixture  = r_mix_scaled(N, p = 0.3, mu = 2.0)
+    )
+  }
+  out
+}
+
+gen_error_matrix <- function(N, K, type = c("gaussian", "t3", "hetero")) {
+  type <- match.arg(type)
+  if (type == "gaussian") {
+    return(matrix(rnorm(N * K), nrow = N, ncol = K))
+  }
+  if (type == "t3") {
+    return(matrix(r_t_scaled(N * K, df = 3), nrow = N, ncol = K))
+  }
+  if (type == "hetero") {
+    base <- matrix(rnorm(N * K), nrow = N, ncol = K)
+    scales <- matrix(runif(N * K, 0.6, 1.4), nrow = N, ncol = K)
+    out <- base * scales
+    out <- out - mean(out)
+    out / sd(as.vector(out))
+  }
+}
+
+# -----------------------------
+# 4. Violation settings
+# -----------------------------
+# Baseline: Gaussian U and errors, linear confounding channel
+# U_t3: non-Gaussian U
+# Err_t3: non-Gaussian errors
+# NL_D: nonlinear exposure confounding
+# Both_NL: nonlinear exposure + outcome confounding
+#
+# Keep it to 5 settings x 5 g = 25 cells.
+# -----------------------------
+setting_grid <- tribble(
+  ~setting,   ~U_type,    ~err_type,   ~nl_d, ~nl_y,
+  "Baseline", "gaussian", "gaussian",  0.0,   0.0,
+  "U_t3",     "t3",       "gaussian",  0.0,   0.0,
+  "Err_t3",   "gaussian", "t3",        0.0,   0.0,
+  "NL_D",     "gaussian", "gaussian",  0.6,   0.0,
+  "Both_NL",  "gaussian", "gaussian",  0.6,   0.6
+)
+
+# -----------------------------
+# 5. True data generator (no X)
+# -----------------------------
+simulate_dataset_nonlinear <- function(
+    g_obj,
+    setting_row,
+    N = 600,
+    K = 5,
+    M = 2,
+    sigma_d = 0.7,
+    sigma_y = 0.7,
+    seed = NULL) {
+
+  if (!is.null(seed)) set.seed(seed)
+
+  # factor loadings
+  A <- matrix(c(
+    1.0, 0.3,
+    0.8, 0.1,
+    0.6, 0.4,
+    0.4, 0.8,
+    0.2, 1.0
+  ), nrow = K, ncol = M, byrow = TRUE)
+
+  gamma <- matrix(c(
+    1.0, 0.2,
+    0.8, 0.4,
+    0.6, 0.6,
+    0.4, 0.9,
+    0.2, 1.1
+  ), nrow = K, ncol = M, byrow = TRUE)
+
+  alpha_d <- seq(-0.5, 0.5, length.out = K)
+  alpha_y <- seq(-0.2, 0.2, length.out = K)
+
+  U_mat <- gen_latent_matrix(N, M, type = setting_row$U_type)
+
+  E_d <- gen_error_matrix(N, K, type = setting_row$err_type)
+  E_y <- gen_error_matrix(N, K, type = setting_row$err_type)
+
+  # exposure confounding signal
+  D_lat <- U_mat %*% t(A)   # N x K
+
+  # optionally nonlinear exposure confounding
+  D_mean <- sweep(D_lat, 2, alpha_d, "+")
+  if (setting_row$nl_d > 0) {
+    D_mean <- D_mean + setting_row$nl_d * tanh(D_lat)
+  }
+
+  d_mat <- D_mean + sigma_d * E_d
+
+  # global standardization for g(z), as in repo nonlinear workflow
+  d_mean <- mean(d_mat)
+  d_sd   <- sd(as.vector(d_mat))
+  z_mat  <- (d_mat - d_mean) / d_sd
+
+  # outcome confounding signal
+  Y_lat <- U_mat %*% t(gamma)  # N x K
+  Y_conf <- Y_lat
+  if (setting_row$nl_y > 0) {
+    Y_conf <- Y_conf + setting_row$nl_y * tanh(Y_lat)
+  }
+
+  f_mat <- matrix(g_obj$f(as.vector(z_mat)), nrow = N, ncol = K)
+
+  Y_mean <- sweep(Y_conf, 2, alpha_y, "+") + f_mat
+  y_mat <- Y_mean + sigma_y * E_y
+
+  list(
+    K = K,
+    N = N,
+    M = M,
+    P_x = 0,
+    A = A,
+    gamma = gamma,
+    alpha_d = alpha_d,
+    alpha_y = alpha_y,
+    d_mat = d_mat,
+    y_mat = y_mat,
+    U_mat = U_mat,
+    d_mean = d_mean,
+    d_sd = d_sd,
+    g_label = g_obj$label
+  )
+}
+
+# -----------------------------
+# 6. Prepare Stan data (P_x = 0)
+# -----------------------------
+prepare_stan_data_noX <- function(sim, L = 8, degree = 3) {
+  K <- sim$K
+  N <- sim$N
+
+  bases <- build_bases(sim$d_mat, L = L, degree = degree)
+
+  d_arr <- lapply(seq_len(N), function(n) as.vector(bases$z_mat[n, ]))
+  y_arr <- lapply(seq_len(N), function(n) as.vector(sim$y_mat[n, ]))
+  X_list <- lapply(seq_len(N), function(n) matrix(numeric(0), nrow = K, ncol = 0))
+
+  list(
+    data_list = list(
+      K = K,
+      N = N,
+      M = sim$M,
+      d = d_arr,
+      y = y_arr,
+      P_x = 0,
+      X = X_list,
+      L = L,
+      B = lapply(seq_len(K), function(k) bases$B_list[[k]])
+    ),
+    aux = list(
+      d_mean = bases$d_mean,
+      d_sd = bases$d_sd,
+      knot_info = bases$knot_info,
+      col_means = bases$col_means
+    )
+  )
+}
+
+# -----------------------------
+# 7. Fit wrapper
+# -----------------------------
+fit_nonlinear_fc <- function(prep, sm, iter = 1500) {
+  fit <- sm$optimize(
+    data = prep$data_list,
+    init = 2,
+    iter = iter,
+    show_messages = FALSE,
+    refresh = 0
+  )
+  mle <- fit$mle()
+  list(
+    fit = fit,
+    mle = mle,
+    beta_lin = as.numeric(mle["beta_lin"]),
+    theta = as.numeric(mle[grep("^theta\\[", names(mle))])
+  )
+}
+
+# -----------------------------
+# 8. True and estimated TE curves
+# TE(d) = dg(d)/dd = g'(z) / d_sd
+# -----------------------------
+te_true_on_d <- function(d_grid, sim, g_obj) {
+  z <- (d_grid - sim$d_mean) / sim$d_sd
+  g_obj$df(z) / sim$d_sd
+}
+
+te_est_on_d <- function(d_grid, fit_obj, aux) {
+  te_point(d_grid, fit_obj$beta_lin, fit_obj$theta, aux)
+}
+
+# -----------------------------
+# 9. Scalar truth summaries
+# -----------------------------
+true_acd <- function(sim, g_obj) {
+  z <- (sim$d_mat - sim$d_mean) / sim$d_sd
+  mean(g_obj$df(as.vector(z)) / sim$d_sd)
+}
+
+true_shift <- function(sim, g_obj, Delta = 1.0) {
+  d0 <- as.vector(sim$d_mat)
+  z0 <- (d0 - sim$d_mean) / sim$d_sd
+  z1 <- (d0 + Delta - sim$d_mean) / sim$d_sd
+  mean(g_obj$f(z1) - g_obj$f(z0))
+}
+
+# -----------------------------
+# 10. One simulation replicate
+# -----------------------------
+run_one_rep <- function(
+    g_name,
+    setting_name,
+    rep_id,
+    sm,
+    L = 8,
+    degree = 3,
+    N = 600,
+    K = 5,
+    M = 2,
+    Delta = 1.0,
+    curve_grid_n = 120) {
+
+  g_obj <- g_lib[[g_name]]
+  setting_row <- setting_grid %>% filter(setting == setting_name)
+
+  sim <- simulate_dataset_nonlinear(
+    g_obj = g_obj,
+    setting_row = setting_row,
+    N = N, K = K, M = M,
+    seed = 1000 + 100 * match(g_name, names(g_lib)) + 10 * match(setting_name, setting_grid$setting) + rep_id
+  )
+
+  prep <- prepare_stan_data_noX(sim, L = L, degree = degree)
+
+  fit_obj <- tryCatch(
+    fit_nonlinear_fc(prep, sm = sm, iter = 1500),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit_obj)) {
+    return(list(
+      metrics = tibble(
+        g = g_name,
+        g_label = g_obj$label,
+        setting = setting_name,
+        rep = rep_id,
+        acd_true = NA_real_,
+        acd_est = NA_real_,
+        shift_true = NA_real_,
+        shift_est = NA_real_,
+        iae_te = NA_real_,
+        ise_te = NA_real_
+      ),
+      curves = tibble(
+        g = g_name,
+        g_label = g_obj$label,
+        setting = setting_name,
+        rep = rep_id,
+        d = NA_real_,
+        te_true = NA_real_,
+        te_est = NA_real_
+      )
+    ))
+  }
+
+  d_grid <- seq(
+    quantile(sim$d_mat, 0.02),
+    quantile(sim$d_mat, 0.98),
+    length.out = curve_grid_n
+  )
+
+  te_true <- te_true_on_d(d_grid, sim, g_obj)
+  te_est  <- te_est_on_d(d_grid, fit_obj, prep$aux)
+
+  acd_t <- true_acd(sim, g_obj)
+  acd_e <- average_causal_derivative(sim$d_mat, fit_obj$beta_lin, fit_obj$theta, prep$aux)
+
+  shift_t <- true_shift(sim, g_obj, Delta = Delta)
+  shift_e <- average_shift_effect(sim$d_mat, Delta, fit_obj$beta_lin, fit_obj$theta, prep$aux)
+
+  metrics <- tibble(
+    g = g_name,
+    g_label = g_obj$label,
+    setting = setting_name,
+    rep = rep_id,
+    acd_true = acd_t,
+    acd_est = acd_e,
+    shift_true = shift_t,
+    shift_est = shift_e,
+    iae_te = mean(abs(te_est - te_true)),
+    ise_te = mean((te_est - te_true)^2)
+  )
+
+  curves <- tibble(
+    g = g_name,
+    g_label = g_obj$label,
+    setting = setting_name,
+    rep = rep_id,
+    d = d_grid,
+    te_true = te_true,
+    te_est = te_est
+  )
+
+  list(metrics = metrics, curves = curves)
+}
+
+# -----------------------------
+# 11. Full simulation
+# -----------------------------
+run_full_sim <- function(
+    nsim = 20,
+    g_names = names(g_lib),
+    setting_names = setting_grid$setting,
+    curve_settings = c("Baseline", "Both_NL"),
+    Delta = 1.0,
+    N = 600,
+    K = 5,
+    M = 2,
+    L = 8,
+    degree = 3) {
+
+  all_metrics <- list()
+  all_curves <- list()
+  idx <- 1
+
+  for (g_name in g_names) {
+    for (setting_name in setting_names) {
+      message("Running: ", g_name, " | ", setting_name)
+      for (r in seq_len(nsim)) {
+        out <- run_one_rep(
+          g_name = g_name,
+          setting_name = setting_name,
+          rep_id = r,
+          sm = sm_nl,
+          L = L,
+          degree = degree,
+          N = N,
+          K = K,
+          M = M,
+          Delta = Delta
+        )
+        all_metrics[[idx]] <- out$metrics
+        if (setting_name %in% curve_settings) {
+          all_curves[[idx]] <- out$curves
+        }
+        idx <- idx + 1
+      }
+    }
+  }
+
+  list(
+    metrics = bind_rows(all_metrics),
+    curves = bind_rows(all_curves)
+  )
+}
+
+# -----------------------------
+# 12. Run
+# -----------------------------
+# Start with nsim = 10 to test, then increase.
+res <- run_full_sim(
+  nsim = 10,
+  curve_settings = c("Baseline", "Both_NL"),
+  Delta = 1.0,
+  N = 500,
+  K = 5,
+  M = 2,
+  L = 8,
+  degree = 3
+)
+
+metrics <- res$metrics %>% filter(is.finite(iae_te))
+curves  <- res$curves  %>% filter(is.finite(d))
+
+# -----------------------------
+# 13. Summaries
+# -----------------------------
+metrics_sum <- metrics %>%
+  mutate(
+    acd_bias = acd_est - acd_true,
+    shift_bias = shift_est - shift_true
+  ) %>%
+  group_by(setting, g_label) %>%
+  summarise(
+    median_iae_te = median(iae_te, na.rm = TRUE),
+    median_ise_te = median(ise_te, na.rm = TRUE),
+    mean_abs_acd_bias = mean(abs(acd_bias), na.rm = TRUE),
+    mean_abs_shift_bias = mean(abs(shift_bias), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(metrics_sum)
+
+# -----------------------------
+# 14. Heatmaps: scalar summaries over all 25 cells
+# -----------------------------
+plot_heatmap <- function(df, value_col, title_txt) {
+  ggplot(df, aes(x = setting, y = g_label, fill = .data[[value_col]])) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.3f", .data[[value_col]])), size = 3) +
+    labs(x = NULL, y = NULL, fill = value_col, title = title_txt) +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(face = "bold")
+    )
+}
+
+p_heat_iae <- plot_heatmap(metrics_sum, "median_iae_te", "Median TE-curve IAE")
+p_heat_acd <- plot_heatmap(metrics_sum, "mean_abs_acd_bias", "Mean absolute ACD error")
+p_heat_shift <- plot_heatmap(metrics_sum, "mean_abs_shift_bias", "Mean absolute shift-effect error")
+
+print(p_heat_iae)
+print(p_heat_acd)
+print(p_heat_shift)
+
+# -----------------------------
+# 15. Curve plot: only selected settings
+#     show average estimated curve + average true curve
+# -----------------------------
+library(dplyr)
+library(purrr)
+library(tibble)
+
+make_curve_mean <- function(curves, grid_n = 120) {
+  out <- list()
+  idx <- 1
+
+  for (g_lab in unique(curves$g_label)) {
+    for (set_name in unique(curves$setting)) {
+      sub <- curves %>% filter(g_label == g_lab, setting == set_name)
+      if (nrow(sub) == 0) next
+
+      # common grid within this panel
+      d_min <- quantile(sub$d, 0.05, na.rm = TRUE)
+      d_max <- quantile(sub$d, 0.95, na.rm = TRUE)
+      d_common <- seq(d_min, d_max, length.out = grid_n)
+
+      reps <- sort(unique(sub$rep))
+
+      interp_list <- lapply(reps, function(r) {
+        ss <- sub %>% filter(rep == r) %>% arrange(d)
+        if (nrow(ss) < 2) return(NULL)
+
+        tibble(
+          rep = r,
+          d = d_common,
+          te_true = approx(ss$d, ss$te_true, xout = d_common, rule = 2)$y,
+          te_est  = approx(ss$d, ss$te_est,  xout = d_common, rule = 2)$y
+        )
+      })
+
+      interp_df <- bind_rows(interp_list)
+
+      out[[idx]] <- interp_df %>%
+        group_by(d) %>%
+        summarise(
+          te_true = mean(te_true, na.rm = TRUE),
+          te_est = mean(te_est, na.rm = TRUE),
+          te_est_lo = quantile(te_est, 0.1, na.rm = TRUE),
+          te_est_hi = quantile(te_est, 0.9, na.rm = TRUE),
+          .groups = "drop"
+        ) %>%
+        mutate(
+          g_label = g_lab,
+          setting = set_name
+        )
+
+      idx <- idx + 1
+    }
+  }
+
+  bind_rows(out)
+}
+
+curve_mean <- make_curve_mean(curves, grid_n = 120)
+
+p_curves <- ggplot(curve_mean, aes(x = d)) +
+  geom_ribbon(aes(ymin = te_est_lo, ymax = te_est_hi), alpha = 0.2) +
+  geom_line(aes(y = te_true), linewidth = 0.8) +
+  geom_line(aes(y = te_est), linetype = "dashed", linewidth = 0.8) +
+  facet_grid(g_label ~ setting, scales = "free_x") +
+  labs(
+    x = "D",
+    y = "Marginal treatment effect",
+    title = "True vs estimated marginal treatment-effect curves"
+  ) +
+  theme_bw() +
+  theme(
+    strip.background = element_rect(fill = "grey95"),
+    plot.title = element_text(face = "bold")
+  )
+
+print(p_curves)
+
+# -----------------------------
+# 16. Optional: compact table for appendix
+# -----------------------------
+appendix_table <- metrics %>%
+  mutate(
+    acd_bias = acd_est - acd_true,
+    shift_bias = shift_est - shift_true
+  ) %>%
+  group_by(setting, g_label) %>%
+  summarise(
+    TE_IAE = sprintf("%.3f (%.3f)", mean(iae_te, na.rm = TRUE), sd(iae_te, na.rm = TRUE)),
+    ACD_abs_bias = sprintf("%.3f", mean(abs(acd_bias), na.rm = TRUE)),
+    Shift_abs_bias = sprintf("%.3f", mean(abs(shift_bias), na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+print(appendix_table)
+
+ggsave("heatmap_iae.png", p_heat_iae, width = 7, height = 4.5, dpi = 300)
+ggsave("heatmap_acd.png", p_heat_acd, width = 7, height = 4.5, dpi = 300)
+ggsave("heatmap_shift.png", p_heat_shift, width = 7, height = 4.5, dpi = 300)
+ggsave("curves_selected_settings.png", p_curves, width = 8, height = 10, dpi = 300)
+```
