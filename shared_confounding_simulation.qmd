@@ -102,7 +102,11 @@ fit_spatial_invariant <- function(model, s, d, y, m, cache = NULL) {
          },
 
          nc_mfactor = {
-           sm_nc_factor <- cmdstanr::cmdstan_model("stan/multi_nc_linear_factor.stan")
+           sm_nc_factor <- if (!is.null(cache$sm_nc_factor)) {
+             cache$sm_nc_factor
+           } else {
+             cmdstanr::cmdstan_model("stan/multi_nc_linear_factor.stan")
+           }
            data_list <- list(K=n, Q=n, N=t, M=m, d=d, y=y)
            opt_result <- sm_nc_factor$optimize(data=data_list, init=2, iter=1000, show_messages=FALSE)
            return(opt_result$mle("beta"))
@@ -141,8 +145,11 @@ fit_spatial_invariant <- function(model, s, d, y, m, cache = NULL) {
                             time = rep(1:t,  n),
                             Y = c(y),
                             D = c(d))
-           gs <- interFE(Y ~ D, data = df, index = c("unit","time"), r = m*2,
-                         force = "none", se = FALSE)
+           gs <- NULL
+           invisible(capture.output({
+             gs <- interFE(Y ~ D, data = df, index = c("unit","time"), r = m*2,
+                           force = "none", se = FALSE)
+           }))
            # ife_res <- ife_bai(y, d, 3)
            return(gs$beta)
          },
@@ -152,8 +159,11 @@ fit_spatial_invariant <- function(model, s, d, y, m, cache = NULL) {
                             time = rep(1:t,  n),
                             Y = c(cache$resY),
                             D = c(cache$resD))
-           gs <- interFE(Y ~ D, data = df, index = c("unit","time"), r = m,
-                         force = "none", se = FALSE)
+           gs <- NULL
+           invisible(capture.output({
+             gs <- interFE(Y ~ D, data = df, index = c("unit","time"), r = m,
+                           force = "none", se = FALSE)
+           }))
            # ife_res <- ife_bai(y, d, 3)
            return(gs$beta)
          },
@@ -1576,6 +1586,61 @@ center_panel <- function(X) {
   as.matrix(X)
 }
 
+# rank-r truncated SVD reconstruction
+svd_reconstruct <- function(W, r) {
+  s <- svd(W)
+  if (r == 0) {
+    return(matrix(0, nrow = nrow(W), ncol = ncol(W)))
+  }
+  U_r <- s$u[, 1:r, drop = FALSE]
+  V_r <- s$v[, 1:r, drop = FALSE]
+  D_r <- diag(s$d[1:r], nrow = r, ncol = r)
+  U_r %*% D_r %*% t(V_r)
+}
+
+# Bai-Ng-style rank selection on a reduced-form joint panel:
+# W = [D, Y - beta_tilde D], where beta_tilde is the pooled OLS slope.
+choose_rank_bn_joint <- function(d, y, rank_candidates, ic_type = "IC2") {
+  beta_tilde <- coef(lm(as.vector(y) ~ as.vector(d)))[2]
+  y_tilde <- y - beta_tilde * d
+
+  W <- cbind(
+    scale(d, center = TRUE, scale = FALSE),
+    scale(y_tilde, center = TRUE, scale = FALSE)
+  )
+
+  TT <- nrow(W)
+  PP <- ncol(W)
+
+  max_rank_allowed <- min(TT, PP) - 1L
+  rank_candidates <- sort(unique(rank_candidates))
+  rank_candidates <- rank_candidates[rank_candidates <= max_rank_allowed]
+  if (length(rank_candidates) == 0) {
+    stop("No candidate ranks are allowed by the panel dimensions.")
+  }
+
+  ic_vals <- numeric(length(rank_candidates))
+  names(ic_vals) <- rank_candidates
+
+  for (j in seq_along(rank_candidates)) {
+    r <- rank_candidates[j]
+    W_hat <- svd_reconstruct(W, r)
+    V_r <- mean((W - W_hat)^2)
+
+    penalty <- switch(
+      ic_type,
+      IC1 = r * ((TT + PP) / (TT * PP)) * log((TT * PP) / (TT + PP)),
+      IC2 = r * ((TT + PP) / (TT * PP)) * log(min(TT, PP)),
+      IC3 = r * (log(min(TT, PP)) / min(TT, PP)),
+      stop("Unknown ic_type")
+    )
+
+    ic_vals[j] <- log(V_r) + penalty
+  }
+
+  as.integer(rank_candidates[which.min(ic_vals)])
+}
+
 # Error generator
 gen_error <- function(type, Tt, N, sigma_target,
                       df_t_err = 4,
@@ -1642,18 +1707,51 @@ apply_nonlinearity <- function(X, type) {
 }
 
 # Run estimators
-run_estimators <- function(s, d, y, m_fit, dreg, yreg) {
+run_estimators <- function(s, d, y, m_fit, dreg, yreg,
+                           benchmark_rank = 3,
+                           rank_candidates = c(1, 2, 3, 4, 5, 6, 8, 10),
+                           max_ident_rank = max(rank_candidates),
+                           rank_ic_type = "IC2",
+                           sm_nc_factor = NULL) {
   d <- center_panel(d)
   y <- center_panel(y)
 
-  dml_rf <- dml_plm(NULL, as.vector(d), as.vector(y), dreg, yreg, nfold = 5)
+  dml_rf <- NULL
+  invisible(capture.output({
+    dml_rf <- dml_plm(NULL, as.vector(d), as.vector(y), dreg, yreg, nfold = 5)
+  }))
+  dml_rf$sm_nc_factor <- sm_nc_factor
+
+  fc_rank <- if (identical(m_fit, "selected")) {
+    choose_rank_bn_joint(
+      d = d,
+      y = y,
+      rank_candidates = rank_candidates,
+      ic_type = rank_ic_type
+    )
+  } else {
+    as.integer(m_fit)
+  }
+
+  enriched_rank <- min(2L * fc_rank, as.integer(max_ident_rank))
+  benchmark_rank <- as.integer(benchmark_rank)
 
   out <- list()
-  for (model in c("stack_dml", "nc_mfactor", "ife")) {
-    est <- fit_spatial_invariant(model, s, d, y, m_fit, dml_rf)
+  for (model in c("stack_dml", "nc_mfactor", "nc_mfactor_enriched", "ife")) {
+    model_rank <- if (model == "stack_dml") NA_integer_ else benchmark_rank
+    if (model == "nc_mfactor") model_rank <- fc_rank
+    if (model == "nc_mfactor_enriched") model_rank <- enriched_rank
+    fit_model <- if (model == "nc_mfactor_enriched") "nc_mfactor" else model
+    est <- fit_spatial_invariant(fit_model, s, d, y, model_rank, dml_rf)
     out[[length(out) + 1]] <- data.frame(
       model = model,
-      estimate = est
+      estimate = unname(est),
+      fitted_rank = model_rank,
+      rank_rule = dplyr::case_when(
+        model == "nc_mfactor" && identical(m_fit, "selected") ~ paste0("Bai-Ng ", rank_ic_type),
+        model == "nc_mfactor_enriched" && identical(m_fit, "selected") ~ paste0("min(2 * Bai-Ng ", rank_ic_type, ", Mmax)"),
+        TRUE ~ "fixed"
+      )
     )
   }
   bind_rows(out)
@@ -1665,12 +1763,13 @@ label_models <- function(df) {
     mutate(
       model = case_when(
         model == "stack_dml" ~ "NUC",
-        model == "nc_mfactor" ~ "FC",
+        model == "nc_mfactor" ~ ifelse(rank_rule == "fixed", "FC", "FC(selected)"),
+        model == "nc_mfactor_enriched" ~ "FC(enriched)",
         model == "ife" ~ "IFE",
         TRUE ~ model
       )
     ) %>%
-    mutate(model = factor(model, levels = c("NUC", "IFE", "FC")))
+    mutate(model = factor(model, levels = c("NUC", "IFE", "FC", "FC(selected)", "FC(enriched)")))
 }
 
 ## ------------------------------------------------------------
@@ -1701,6 +1800,10 @@ run_nonGaussian_sim <- function(
     skew_alpha = 5,
     discrete_prob = c(0.1, 0.15, 0.2, 0.25, 0.3),
     m_fit = m,
+    benchmark_rank = m,
+    rank_candidates = c(1, 2, 3, 4, 5, 6, 8, 10),
+    max_ident_rank = max(rank_candidates),
+    rank_ic_type = "IC2",
     dreg,
     yreg,
     seed = 2025) {
@@ -1715,6 +1818,7 @@ run_nonGaussian_sim <- function(
   gamma <- params$gamma
   B_true <- params$B_true
   sigmaU <- diag(m)
+  sm_nc_factor <- cmdstanr::cmdstan_model("stan/multi_nc_linear_factor.stan")
 
   results <- list()
 
@@ -1771,7 +1875,17 @@ run_nonGaussian_sim <- function(
       d <- u %*% t(A) + epsD
       y <- d %*% t(B_true) + u %*% t(gamma) + epsY
 
-      fit_df <- run_estimators(s, d, y, m_fit = m_fit, dreg = dreg, yreg = yreg)
+      fit_df <- run_estimators(
+        s, d, y,
+        m_fit = m_fit,
+        benchmark_rank = benchmark_rank,
+        dreg = dreg,
+        yreg = yreg,
+        rank_candidates = rank_candidates,
+        max_ident_rank = max_ident_rank,
+        rank_ic_type = rank_ic_type,
+        sm_nc_factor = sm_nc_factor
+      )
       fit_df$simulation <- i
       fit_df$facet <- ftype
 
@@ -1814,12 +1928,12 @@ run_nonlinear_sim <- function(
     sigma_Y_err = 0.7,
     exposure_types = c("linear_plus_cubic", "cubic", "tanh"),
     outcome_types = c("linear_plus_cubic", "sine", "tanh"),
-    both_pairs = list(
-      c("linear_plus_cubic", "linear_plus_cubic"),
-      c("cubic", "sine"),
-      c("tanh", "tanh")
-    ),
+    both_pairs = list(),
     m_fit = m,
+    benchmark_rank = m,
+    rank_candidates = c(1, 2, 3, 4, 5, 6, 8, 10),
+    max_ident_rank = max(rank_candidates),
+    rank_ic_type = "IC2",
     dreg,
     yreg,
     seed = 2026,
@@ -1834,6 +1948,7 @@ run_nonlinear_sim <- function(
   gamma <- params$gamma
   B_true <- params$B_true
   sigmaU <- diag(m)
+  sm_nc_factor <- cmdstanr::cmdstan_model("stan/multi_nc_linear_factor.stan")
   
   nice_label <- function(x) {
     dplyr::case_when(
@@ -1868,7 +1983,17 @@ run_nonlinear_sim <- function(
       d <- d_signal + epsD
       y <- d %*% t(B_true) + lin_Y + epsY
 
-      fit_df <- run_estimators(s, d, y, m_fit = m_fit, dreg = dreg, yreg = yreg)
+      fit_df <- run_estimators(
+        s, d, y,
+        m_fit = m_fit,
+        benchmark_rank = benchmark_rank,
+        dreg = dreg,
+        yreg = yreg,
+        rank_candidates = rank_candidates,
+        max_ident_rank = max_ident_rank,
+        rank_ic_type = rank_ic_type,
+        sm_nc_factor = sm_nc_factor
+      )
       fit_df$simulation <- i
       fit_df$facet <- paste0("Exp: ", nice_label(etype))
       results[[length(results) + 1]] <- fit_df
@@ -1880,7 +2005,17 @@ run_nonlinear_sim <- function(
       d <- lin_D + epsD
       y <- d %*% t(B_true) + conf_signal + epsY
 
-      fit_df <- run_estimators(s, d, y, m_fit = m_fit, dreg = dreg, yreg = yreg)
+      fit_df <- run_estimators(
+        s, d, y,
+        m_fit = m_fit,
+        benchmark_rank = benchmark_rank,
+        dreg = dreg,
+        yreg = yreg,
+        rank_candidates = rank_candidates,
+        max_ident_rank = max_ident_rank,
+        rank_ic_type = rank_ic_type,
+        sm_nc_factor = sm_nc_factor
+      )
       fit_df$simulation <- i
       fit_df$facet <- paste0("Out: ", nice_label(ytype))
       results[[length(results) + 1]] <- fit_df
@@ -1897,7 +2032,17 @@ run_nonlinear_sim <- function(
       d <- d_signal + epsD
       y <- d %*% t(B_true) + conf_signal + epsY
 
-      fit_df <- run_estimators(s, d, y, m_fit = m_fit, dreg = dreg, yreg = yreg)
+      fit_df <- run_estimators(
+        s, d, y,
+        m_fit = m_fit,
+        benchmark_rank = benchmark_rank,
+        dreg = dreg,
+        yreg = yreg,
+        rank_candidates = rank_candidates,
+        max_ident_rank = max_ident_rank,
+        rank_ic_type = rank_ic_type,
+        sm_nc_factor = sm_nc_factor
+      )
       fit_df$simulation <- i
       fit_df$facet <- paste0("Both: ", nice_label(etype), " / ", nice_label(ytype))
       results[[length(results) + 1]] <- fit_df
@@ -2017,7 +2162,7 @@ results_nonGaussian_df <- run_nonGaussian_sim(
   m = 3,
   sigma_D_err = 0.7,
   sigma_Y_err = 0.7,
-  m_fit = 3,
+  m_fit = "selected",
   dreg = dreg,
   yreg = yreg,
   seed = 2025
@@ -2025,7 +2170,7 @@ results_nonGaussian_df <- run_nonGaussian_sim(
 
 # Part 2: Nonlinear
 results_nonlinear_df <- run_nonlinear_sim(
-  n_simulations = 10,
+  n_simulations = 50,
   N = 30,
   t = 100,
   m = 3,
@@ -2033,7 +2178,7 @@ results_nonlinear_df <- run_nonlinear_sim(
   sigma_Y_err = 0.7,
   exposure_types = c("linear_plus_cubic", "cubic", "tanh"),
   outcome_types = c("linear_plus_cubic", "sine", "tanh"),
-  m_fit = 6,
+  m_fit = "selected",
   dreg = dreg,
   yreg = yreg,
   seed = 2026,
@@ -2041,6 +2186,9 @@ results_nonlinear_df <- run_nonlinear_sim(
   outcome_loading_scale = 1,
   outcome_nonlinear_scale = 1
 )
+
+saveRDS(results_nonGaussian_df, file = "data/sim_nonGaussian_N30T100.rds")
+saveRDS(results_nonlinear_df, file = "data/sim_nonlinear_N30T100.rds")
 
 ## ============================================================
 ## Summaries
@@ -2066,8 +2214,24 @@ summary_nonlinear <- results_nonlinear_df %>%
     .groups = "drop"
   )
 
+rank_nonGaussian <- results_nonGaussian_df %>%
+  filter(model %in% c("FC(selected)", "FC(enriched)")) %>%
+  count(facet, model, fitted_rank, name = "n") %>%
+  group_by(facet, model) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+rank_nonlinear <- results_nonlinear_df %>%
+  filter(model %in% c("FC(selected)", "FC(enriched)")) %>%
+  count(facet, model, fitted_rank, name = "n") %>%
+  group_by(facet, model) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
 print(summary_nonGaussian)
 print(summary_nonlinear)
+print(rank_nonGaussian)
+print(rank_nonlinear)
 
 ## ============================================================
 ## Figures
@@ -2079,11 +2243,16 @@ p_nonlinear  <- plot_nonlinear(results_nonlinear_df)
 print(p_nonGaussian)
 print(p_nonlinear)
 
-# ggsave("sim_nonGaussian_N30T100.pdf", p_nonGaussian,
-#        width = 8, height = 5.5, units = "in", dpi = 300)
+saveRDS(rank_nonGaussian, file = "data/sim_nonGaussian_rank_sel_N30T100.rds")
+saveRDS(rank_nonlinear, file = "data/sim_nonlinear_rank_sel_N30T100.rds")
 
-# ggsave("sim_nonlinear_N30T100.pdf", p_nonlinear,
-#        width = 8, height = 5.5, units = "in", dpi = 300)
+dir.create("figures", showWarnings = FALSE)
+
+ggsave("figures/sim_nonGaussian_N30T100.pdf", p_nonGaussian,
+       width = 8, height = 5.5, units = "in", dpi = 300)
+
+ggsave("figures/sim_nonlinear_N30T100.pdf", p_nonlinear,
+       width = 8, height = 5.5, units = "in", dpi = 300)
 ```
 
 
@@ -2324,13 +2493,13 @@ selected_rank_tab <- selected_rank_df %>%
 
 print(selected_rank_tab)
 
-# saveRDS(results_rank_fc_df, file = "sim_rank_fc_N30T100.rds")
-# saveRDS(selected_rank_tab, file = "sim_rank_sel_N30T100.rds")
+saveRDS(results_rank_fc_df, file = "data/sim_rank_fc_N30T100.rds")
+saveRDS(selected_rank_tab, file = "data/sim_rank_sel_N30T100.rds")
 
 # -----------------------------
 # Main figure: estimation error by true rank
 # -----------------------------
-p_rank_fc <- ggplot(results_rank_fc_df[results_rank_fc_df$true_rank != 15,],
+p_rank_fc <- ggplot(results_rank_fc_df,
                     aes(x = model, y = error, fill = model)) +
   geom_boxplot(fill = "dark gray", outlier.alpha = 0.3, width = 0.75) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
@@ -2347,12 +2516,13 @@ p_rank_fc <- ggplot(results_rank_fc_df[results_rank_fc_df$true_rank != 15,],
   )
 
 print(p_rank_fc)
-# ggsave("sim_rank_fc_N30T100.pdf", p_rank_fc, width = 8, height = 5, units = "in", dpi = 300)
+dir.create("figures", showWarnings = FALSE)
+ggsave("figures/sim_rank_fc_N30T100.pdf", p_rank_fc, width = 8, height = 5, units = "in", dpi = 300)
 
------------------------------
+# -----------------------------
 # Supplementary figure: selected rank frequencies
 # -----------------------------
-p_rank_sel <- ggplot(selected_rank_tab[selected_rank_tab$true_rank != 15,],
+p_rank_sel <- ggplot(selected_rank_tab,
                      aes(x = factor(selected_rank), y = prop)) +
   geom_col(width = 0.75, fill = "gray60") +
   facet_wrap(~ true_rank_label, nrow = 1) +
@@ -2364,7 +2534,7 @@ p_rank_sel <- ggplot(selected_rank_tab[selected_rank_tab$true_rank != 15,],
   theme_bw(base_size = 14)
 
 print(p_rank_sel)
-# ggsave("sim_rank_sel_N30T100.pdf", p_rank_sel, width = 8, height = 5, units = "in", dpi = 300)
+ggsave("figures/sim_rank_sel_N30T100.pdf", p_rank_sel, width = 8, height = 5, units = "in", dpi = 300)
 ```
 
 
